@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>抄表數據看板</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1d232b; --muted: #6b7480;
+    --border: #e3e6ea; --accent: #2f6fde; --bad: #d62f2f; --bad-bg: #fde8e8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --card: #1d2128; --text: #e7eaee; --muted: #9aa3ad;
+      --border: #2e343d; --accent: #6aa0ff; --bad: #ff6b6b; --bad-bg: #3a1f22; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 16px; }
+  h1 { font-size: 22px; margin: 0; }
+  .meta { color: var(--muted); font-size: 13px; }
+  button { margin-left: auto; padding: 6px 14px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--card); color: var(--text); cursor: pointer; font-size: 14px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; white-space: nowrap; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; }
+  th small { display: block; font-weight: 400; font-size: 11px; }
+  td.bad { color: var(--bad); background: var(--bad-bg); font-weight: 700; }
+  td .diff { color: var(--muted); font-size: 11px; margin-left: 4px; }
+  td.bad .diff { color: var(--bad); }
+  .legend { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; margin-top: 16px; }
+  .chart-card h2 { font-size: 15px; margin: 0 0 4px; }
+  .chart-card .sub { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .chart-box { position: relative; height: 200px; }
+  .error { color: var(--bad); }
+  @media (max-width: 420px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>抄表數據看板</h1>
+    <span class="meta" id="meta">載入中…</span>
+    <button id="reload">重新整理</button>
+  </header>
+
+  <section class="card">
+    <div class="table-wrap"><table id="tbl"></table></div>
+    <div class="legend">紅色＝與前一天相比增量超過門檻，或數值倒退（小於前一天）。小字為與前一天的差值。</div>
+  </section>
+
+  <section class="grid" id="charts"></section>
+</main>
+
+<script>
+const SHEET_ID = '1s1NkugXvaYixqTzJVlar5N0rTfSIl-sQbxGuIRhQgI0';
+const CSV_URL = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv`;
+const DAYS = 10;
+
+// 欄位名稱與每日增量門檻
+const FIELDS = [
+  { key: '自來水表', limit: 60 },
+  { key: '汙水排放', limit: 40 },
+  { key: '電信室表', limit: 20 },
+  { key: '汙水電表', limit: 70 },
+  { key: '小公電(A)', limit: 5 },
+  { key: '小公電(B)', limit: 5 },
+  { key: '大公電', limit: 15 },
+];
+
+function parseCSV(text) {
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (c === '"') q = false;
+      else cell += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+    else if (c !== '\r') cell += c;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+
+// "2026/10/25 上午 2:07:07" 或 "2026/10/25 14:07:07"
+function parseStamp(s) {
+  const m = s.trim().match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})\s*(上午|下午)?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return NaN;
+  let h = +m[5];
+  if (m[4] === '下午' && h < 12) h += 12;
+  if (m[4] === '上午' && h === 12) h = 0;
+  return new Date(+m[1], m[2] - 1, +m[3], h, +m[6], +(m[7] || 0)).getTime();
+}
+
+// "2026/10/22" -> "2026-10-22"（可排序）
+function normDate(s) {
+  const m = s.trim().match(/^(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})/);
+  return m ? `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}` : null;
+}
+
+function buildRecords(rows) {
+  const head = rows[0].map(h => h.trim());
+  const iStamp = head.indexOf('時間戳記'), iDate = head.indexOf('抄表日期');
+  const idx = Object.fromEntries(FIELDS.map(f => [f.key, head.indexOf(f.key)]));
+
+  // 同一抄表日期只保留時間戳記最新的一筆
+  const byDate = new Map();
+  for (const r of rows.slice(1)) {
+    const date = normDate(r[iDate] || '');
+    if (!date) continue;
+    const ts = parseStamp(r[iStamp] || '');
+    const prev = byDate.get(date);
+    if (prev && !(ts >= prev.ts)) continue;
+    const vals = {};
+    for (const f of FIELDS) {
+      const v = parseFloat(String(r[idx[f.key]] ?? '').replace(/,/g, ''));
+      vals[f.key] = Number.isFinite(v) ? v : null;
+    }
+    byDate.set(date, { date, ts, vals });
+  }
+
+  const all = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+  // 與前一筆（前一天）比較
+  all.forEach((rec, i) => {
+    rec.diff = {}; rec.bad = {};
+    const prev = all[i - 1];
+    for (const f of FIELDS) {
+      const cur = rec.vals[f.key], p = prev?.vals[f.key];
+      if (cur == null || p == null) { rec.diff[f.key] = null; rec.bad[f.key] = false; continue; }
+      const d = +(cur - p).toFixed(4);
+      rec.diff[f.key] = d;
+      rec.bad[f.key] = d > f.limit || d < 0;
+    }
+  });
+  return all.slice(-DAYS);
+}
+
+const fmtDate = d => d.slice(5).replace('-', '/');
+const fmtNum = n => n == null ? '—' : n.toLocaleString('zh-TW');
+const fmtDiff = d => d == null ? '' : (d > 0 ? '+' : '') + d.toLocaleString('zh-TW');
+
+function renderTable(recs) {
+  const tbl = document.getElementById('tbl');
+  let html = '<thead><tr><th>抄表日期</th>' +
+    FIELDS.map(f => `<th>${f.key}<small>門檻 ${f.limit}</small></th>`).join('') + '</tr></thead><tbody>';
+  for (const r of [...recs].reverse()) {
+    html += `<tr><td>${r.date.replace(/-/g, '/')}</td>` + FIELDS.map(f =>
+      `<td class="${r.bad[f.key] ? 'bad' : ''}">${fmtNum(r.vals[f.key])}<span class="diff">${fmtDiff(r.diff[f.key])}</span></td>`
+    ).join('') + '</tr>';
+  }
+  tbl.innerHTML = html + '</tbody>';
+}
+
+let charts = [];
+function renderCharts(recs) {
+  charts.forEach(c => c.destroy()); charts = [];
+  const css = getComputedStyle(document.documentElement);
+  const accent = css.getPropertyValue('--accent').trim();
+  const bad = css.getPropertyValue('--bad').trim();
+  const muted = css.getPropertyValue('--muted').trim();
+  const border = css.getPropertyValue('--border').trim();
+  const wrap = document.getElementById('charts');
+  wrap.innerHTML = '';
+
+  for (const f of FIELDS) {
+    const nBad = recs.filter(r => r.bad[f.key]).length;
+    const card = document.createElement('div');
+    card.className = 'card chart-card';
+    card.innerHTML = `<h2>${f.key}</h2><div class="sub">每日增量門檻 ${f.limit}` +
+      (nBad ? `　<span style="color:${bad}">異常 ${nBad} 天</span>` : '') +
+      `</div><div class="chart-box"><canvas></canvas></div>`;
+    wrap.appendChild(card);
+
+    const colors = recs.map(r => r.bad[f.key] ? bad : accent);
+    charts.push(new Chart(card.querySelector('canvas'), {
+      type: 'line',
+      data: {
+        labels: recs.map(r => fmtDate(r.date)),
+        datasets: [{
+          data: recs.map(r => r.vals[f.key]),
+          borderColor: accent, borderWidth: 2, tension: 0,
+          pointBackgroundColor: colors, pointBorderColor: colors,
+          pointRadius: recs.map(r => r.bad[f.key] ? 6 : 3.5), pointHoverRadius: 7,
+          segment: { borderColor: ctx => recs[ctx.p1DataIndex]?.bad[f.key] ? bad : accent },
+          spanGaps: true,
+        }],
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => {
+            const r = recs[ctx.dataIndex], d = r.diff[f.key];
+            return `${fmtNum(r.vals[f.key])}` + (d == null ? '' : `（較前日 ${fmtDiff(d)}${r.bad[f.key] ? '，異常' : ''}）`);
+          } } },
+        },
+        scales: {
+          x: { ticks: { color: muted }, grid: { display: false } },
+          y: { ticks: { color: muted }, grid: { color: border } },
+        },
+      },
+    }));
+  }
+}
+
+async function load() {
+  const meta = document.getElementById('meta');
+  meta.textContent = '載入中…';
+  try {
+    const res = await fetch(CSV_URL + '&_=' + Date.now(), { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const recs = buildRecords(parseCSV(await res.text()));
+    if (!recs.length) throw new Error('沒有可用的資料');
+    renderTable(recs);
+    renderCharts(recs);
+    const nBad = recs.reduce((s, r) => s + FIELDS.filter(f => r.bad[f.key]).length, 0);
+    meta.textContent = `最近 ${recs.length} 天（${fmtDate(recs[0].date)}–${fmtDate(recs.at(-1).date)}）· 異常 ${nBad} 筆 · 更新於 ${new Date().toLocaleTimeString('zh-TW')}`;
+  } catch (e) {
+    meta.innerHTML = `<span class="error">讀取失敗：${e.message}（請確認試算表已設為「知道連結的人皆可檢視」）</span>`;
+  }
+}
+
+document.getElementById('reload').onclick = load;
+load();
+</script>
+</body>
+</html>
